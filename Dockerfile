@@ -6,4 +6,3 @@ RUN wget https://github.com/fatedier/frp/releases/download/v0.33.0/frp_0.33.0_li
     rm -rf frp_0.33.0_linux_amd64.tar.gz
 
 WORKDIR frp_0.33.0_linux_amd64
-COPY frps.ini frps.ini

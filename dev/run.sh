@@ -1,0 +1,1 @@
+docker run -it -v $(pwd)/../:/root/frp-test --network=host --name frptestc frptest bash

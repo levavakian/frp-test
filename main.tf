@@ -1,17 +1,27 @@
+# AWS account that contains the route53 domain
+provider "aws" {
+  alias = "account_route53" # Specific to your setup
+  region = "us-east-2"
+}
+
 provider "aws" {
   region = "us-east-2"
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
 }
 
 variable "server_port" {
   description = "The port the server will use for HTTP requests"
   type        = number
-  default     = 50
+  default     = 80
 }
 
 variable "server_port_https" {
   description = "The port the server will use for HTTP requests"
   type        = number
-  default     = 60
+  default     = 443
 }
 
 variable "public_port" {
@@ -53,6 +63,15 @@ resource "aws_subnet" "default" {
   vpc_id                  = aws_vpc.default.id
   cidr_block              = "10.0.1.0/24"
   map_public_ip_on_launch = true
+  availability_zone = data.aws_availability_zones.available.names[0]
+}
+
+# Create a subnet to launch our instances into
+resource "aws_subnet" "default2" {
+  vpc_id                  = aws_vpc.default.id
+  cidr_block              = "10.0.2.0/24"
+  map_public_ip_on_launch = true
+  availability_zone = data.aws_availability_zones.available.names[1]
 }
 
 # A security group for the ELB so it is accessible via the web
@@ -125,25 +144,118 @@ resource "aws_security_group" "default" {
   }
 }
 
-resource "aws_elb" "web" {
-  name = "terraform-example-elb"
+resource "aws_lb" "web" {
+  name = "terraform-example-lb"
+  load_balancer_type = "network"
 
-  subnets         = [aws_subnet.default.id]
-  security_groups = [aws_security_group.elb.id]
-  instances       = [aws_instance.web.id]
+  subnets         = [aws_subnet.default.id, aws_subnet.default2.id]
+  # security_groups = [aws_security_group.elb.id]
+}
 
-  listener {
-    instance_port     = var.server_port
-    instance_protocol = "http"
-    lb_port           = var.public_port
-    lb_protocol       = "http"
+# This data source looks up the public DNS zone
+data "aws_route53_zone" "public" {
+  name         = "frp-test.tk"
+  private_zone = false
+  provider     = aws.account_route53
+}
+
+resource "aws_acm_certificate" "acm" {
+  domain_name       = "frp-test.tk"
+  subject_alternative_names = ["*.frp-test.tk"]
+  validation_method = "DNS"
+}
+
+resource "aws_acm_certificate_validation" "cert" {
+  certificate_arn         = aws_acm_certificate.acm.arn
+  validation_record_fqdns = [for record in aws_route53_record.public : record.fqdn]
+}
+
+resource "aws_route53_record" "public" {
+  for_each = {
+    for dvo in aws_acm_certificate.acm.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
   }
 
-  listener {
-    instance_port     = var.server_port_https
-    instance_protocol = "http"
-    lb_port           = var.public_port_https
-    lb_protocol       = "http"
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = data.aws_route53_zone.public.zone_id
+}
+
+# Standard route53 DNS record for "myapp" pointing to an ALB
+resource "aws_route53_record" "myapp" {
+  zone_id = data.aws_route53_zone.public.zone_id
+  name    = "proxy"
+  type    = "A"
+  alias {
+    name                   = aws_lb.web.dns_name
+    zone_id                = aws_lb.web.zone_id
+    evaluate_target_health = false
+  }
+  provider = aws.account_route53
+}
+
+resource "aws_lb_target_group" "target1" {
+  name     = "httptarget"
+  port     = var.server_port
+  protocol = "TCP"
+  vpc_id   = aws_vpc.default.id
+  target_type = "ip"
+  stickiness {
+    enabled = false
+    type = "lb_cookie"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "attachment1" {
+  target_group_arn = aws_lb_target_group.target1.arn
+  target_id        = aws_instance.web.private_ip
+  port             = var.server_port
+}
+
+resource "aws_lb_listener" "listener1" {
+  load_balancer_arn = aws_lb.web.arn
+  port           = var.public_port
+  protocol       = "TCP"
+
+  default_action {
+    target_group_arn = aws_lb_target_group.target1.id
+    type = "forward"
+  }
+}
+
+resource "aws_lb_target_group" "target2" {
+  name     = "httpstarget"
+  port     = var.server_port_https
+  protocol = "TCP"
+  vpc_id   = aws_vpc.default.id
+  target_type = "ip"
+  stickiness {
+    enabled = false
+    type = "lb_cookie"
+  }
+}
+
+resource "aws_lb_target_group_attachment" "attachment2" {
+  target_group_arn = aws_lb_target_group.target2.arn
+  target_id        = aws_instance.web.private_ip
+  port             = var.server_port_https
+}
+
+resource "aws_lb_listener" "listener2" {
+  load_balancer_arn = aws_lb.web.arn
+  port           = var.public_port_https
+  protocol       = "TLS"
+  certificate_arn = aws_acm_certificate_validation.cert.certificate_arn
+
+  default_action {
+    target_group_arn = aws_lb_target_group.target2.id
+    type = "forward"
   }
 }
 
@@ -179,9 +291,5 @@ resource "aws_instance" "web" {
 }
 
 output "address" {
-  value = aws_elb.web.dns_name
-}
-
-output "vpcaddress" {
-  value = aws_elb.web.dns_name
+  value = aws_lb.web.dns_name
 }
